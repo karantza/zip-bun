@@ -23,7 +23,9 @@
     "test:coverage": "bun test --coverage",
     "lint": "biome check",
     "lint:write": "biome check --write",
-    "build": "tsdown"
+    "build": "tsdown",
+    "build:native": "cp src/zip_wrapper.c src/miniz.c src/miniz.h dist/",
+    "prepare": "bunx --bun tsdown && bun run build:native"
   },
   "keywords": [
     "zip",
