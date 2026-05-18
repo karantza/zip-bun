@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
 
 // Platform detection and fixes
 #ifdef __APPLE__
@@ -33,29 +34,78 @@ typedef struct {
 
 // Global storage for zip archives
 #define MAX_HANDLES 100
+#define SLOT_RESERVED (zip_handle_t *const)(uintptr_t)1
 
 static zip_handle_t* zip_handles[MAX_HANDLES] = {NULL};
-static int next_handle_id = 0;
+static pthread_mutex_t zip_handles_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Claim the first free slot in the array.
+// Returns -1 if all MAX_HANDLES slots are in use.
+static int claim_slot(void)
+{
+    pthread_mutex_lock(&zip_handles_lock);
+    int slot = -1;
+    for (int i = 0; i < MAX_HANDLES; i++)
+    {
+        if (zip_handles[i] == NULL)
+        {
+            zip_handles[i] = SLOT_RESERVED;
+            slot = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&zip_handles_lock);
+    return slot;
+}
+
+// Fill a slot. (It should've been claimed first by claim_slot.)
+static int use_slot(int slot, zip_handle_t *handle)
+{
+    pthread_mutex_lock(&zip_handles_lock);
+    zip_handles[slot] = handle;
+    pthread_mutex_unlock(&zip_handles_lock);
+    return slot;
+}
+
+// Releases the zip handle and frees the slot.
+static void free_zip(int slot)
+{
+    if (slot < 0 || slot >= MAX_HANDLES)
+        return;
+
+    // Free if it's actually allocated
+    if (zip_handles[slot] != NULL && zip_handles[slot] != SLOT_RESERVED)
+        free(zip_handles[slot]);
+
+    pthread_mutex_lock(&zip_handles_lock);
+    zip_handles[slot] = NULL;
+    pthread_mutex_unlock(&zip_handles_lock);
+}
 
 // Create a new zip archive
 int create_zip(const char* filename) {
-    if (next_handle_id >= MAX_HANDLES) return -1;
-    
+    int slot = claim_slot();
+    if (slot < 0)
+        return -1;
+
     zip_handle_t* handle = (zip_handle_t*)malloc(sizeof(zip_handle_t));
-    if (!handle) return -1;
-    
-    memset(handle, 0, sizeof(zip_handle_t));
-    handle->is_writer = 1;
-    
-    mz_bool status = mz_zip_writer_init_file(&handle->archive, filename, 0);
-    
-    if (!status) {
-        free(handle);
+    if (!handle)
+    {
+        free_zip(slot);
         return -1;
     }
-    
-    zip_handles[next_handle_id] = handle;
-    return next_handle_id++;
+
+    memset(handle, 0, sizeof(zip_handle_t));
+    handle->is_writer = 1;
+
+    mz_bool status = mz_zip_writer_init_file(&handle->archive, filename, 0);
+
+    if (!status) {
+        free_zip(slot);
+        return -1;
+    }
+
+    return use_slot(slot, handle);
 }
 
 // Add a file to zip archive
@@ -63,7 +113,7 @@ int add_file_to_zip(int handle_id, const char* filename, const void* data, size_
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || !zip_handles[handle_id]->is_writer) {
         return 0;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     mz_bool status = mz_zip_writer_add_mem(&handle->archive, filename, data, data_length, compression_level);
     return status ? 1 : 0;
@@ -74,36 +124,40 @@ int finalize_zip(int handle_id) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || !zip_handles[handle_id]->is_writer) {
         return 0;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     mz_bool status = mz_zip_writer_finalize_archive(&handle->archive);
     mz_zip_writer_end(&handle->archive);
-    
-    free(handle);
-    zip_handles[handle_id] = NULL;
-    
+    free_zip(handle_id);
     return status ? 1 : 0;
 }
 
 // Open an existing zip archive for reading
 int open_zip(const char* filename) {
-    if (next_handle_id >= MAX_HANDLES) return -1;
-    
+    int slot = claim_slot();
+    if (slot < 0)
+        return -1;
+
     zip_handle_t* handle = (zip_handle_t*)malloc(sizeof(zip_handle_t));
-    if (!handle) return -1;
-    
-    memset(handle, 0, sizeof(zip_handle_t));
-    handle->is_writer = 0;
-    
-    mz_bool status = mz_zip_reader_init_file(&handle->archive, filename, 0);
-    
-    if (!status) {
-        free(handle);
+
+    if (!handle)
+    {
+        free_zip(slot);
         return -1;
     }
-    
-    zip_handles[next_handle_id] = handle;
-    return next_handle_id++;
+
+    memset(handle, 0, sizeof(zip_handle_t));
+    handle->is_writer = 0;
+
+    if (!mz_zip_reader_init_file(&handle->archive, filename, 0))
+    {
+        free(handle);
+        free_zip(slot);
+        return -1;
+    }
+
+    use_slot(slot, handle);
+    return slot;
 }
 
 // Get number of files in zip archive
@@ -111,7 +165,7 @@ int get_file_count(int handle_id) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || zip_handles[handle_id]->is_writer) {
         return -1;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     return (int)mz_zip_reader_get_num_files(&handle->archive);
 }
@@ -130,31 +184,31 @@ int get_file_info(int handle_id, int file_index, file_info_t* info) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || zip_handles[handle_id]->is_writer) {
         return 0;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     mz_zip_archive_file_stat file_stat;
     mz_bool status = mz_zip_reader_file_stat(&handle->archive, file_index, &file_stat);
-    
+
     if (!status) return 0;
-    
+
     // Optimize string copying with length checks
     size_t filename_len = strlen(file_stat.m_filename);
     size_t comment_len = strlen(file_stat.m_comment);
-    
+
     if (filename_len >= 256) filename_len = 255;
     if (comment_len >= 256) comment_len = 255;
-    
+
     memcpy(info->filename, file_stat.m_filename, filename_len);
     info->filename[filename_len] = '\0';
-    
+
     memcpy(info->comment, file_stat.m_comment, comment_len);
     info->comment[comment_len] = '\0';
-    
+
     info->uncompressed_size = file_stat.m_uncomp_size;
     info->compressed_size = file_stat.m_comp_size;
     info->is_directory = mz_zip_reader_is_file_a_directory(&handle->archive, file_index) ? 1 : 0;
     info->is_encrypted = mz_zip_reader_is_file_encrypted(&handle->archive, file_index) ? 1 : 0;
-    
+
     return 1;
 }
 
@@ -163,7 +217,7 @@ void* extract_file(int handle_id, int file_index, size_t* size) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || zip_handles[handle_id]->is_writer) {
         return NULL;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     void* data = mz_zip_reader_extract_to_heap(&handle->archive, file_index, size, 0);
     return data;
@@ -174,13 +228,12 @@ int close_zip(int handle_id) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || zip_handles[handle_id]->is_writer) {
         return 0;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     mz_bool status = mz_zip_reader_end(&handle->archive);
-    
-    free(handle);
-    zip_handles[handle_id] = NULL;
-    
+
+    free_zip(handle_id);
+
     return status ? 1 : 0;
 }
 
@@ -189,7 +242,7 @@ int find_file(int handle_id, const char* filename) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || zip_handles[handle_id]->is_writer) {
         return -1;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     return mz_zip_reader_locate_file(&handle->archive, filename, NULL, 0);
 }
@@ -199,12 +252,12 @@ void* extract_file_by_name(int handle_id, const char* filename, size_t* size) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || zip_handles[handle_id]->is_writer) {
         return NULL;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     int file_index = mz_zip_reader_locate_file(&handle->archive, filename, NULL, 0);
-    
+
     if (file_index < 0) return NULL;
-    
+
     return mz_zip_reader_extract_to_heap(&handle->archive, file_index, size, 0);
 }
 
@@ -220,42 +273,46 @@ int extract_file_to_buffer(int handle_id, int file_index, void* output_buffer, s
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || zip_handles[handle_id]->is_writer) {
         return -1;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
     size_t extracted_size = 0;
-    
+
     mz_bool status = mz_zip_reader_extract_to_mem(&handle->archive, file_index, output_buffer, buffer_size, 0);
-    
+
     if (!status) return -1;
-    
+
     // Get the actual size of the extracted data
     mz_zip_archive_file_stat file_stat;
     if (mz_zip_reader_file_stat(&handle->archive, file_index, &file_stat)) {
         extracted_size = file_stat.m_uncomp_size;
     }
-    
+
     return (int)extracted_size;
 }
 
 // Create a new zip archive in memory
 int create_zip_in_memory() {
-    if (next_handle_id >= MAX_HANDLES) return -1;
-    
+    int slot = claim_slot();
+    if (slot < 0)
+        return -1;
+
     zip_handle_t* handle = (zip_handle_t*)malloc(sizeof(zip_handle_t));
-    if (!handle) return -1;
-    
-    memset(handle, 0, sizeof(zip_handle_t));
-    handle->is_writer = 1;
-    
-    mz_bool status = mz_zip_writer_init_heap(&handle->archive, 0, 0);
-    
-    if (!status) {
-        free(handle);
+    if (!handle)
+    {
+        free_zip(slot);
         return -1;
     }
-    
-    zip_handles[next_handle_id] = handle;
-    return next_handle_id++;
+
+    memset(handle, 0, sizeof(zip_handle_t));
+    handle->is_writer = 1;
+
+    mz_bool status = mz_zip_writer_init_heap(&handle->archive, 0, 0);
+    if (!status) {
+        free_zip(slot);
+        return -1;
+    }
+
+    return use_slot(slot, handle);
 }
 
 // Get the size of the final archive without finalizing
@@ -263,16 +320,16 @@ int get_zip_final_size(int handle_id) {
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || !zip_handles[handle_id]->is_writer) {
         return -1;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
-    
+
     // Get the current size of the archive
     size_t current_size = handle->archive.m_pState->m_mem_size;
-    
+
     // Estimate the final size (this is approximate)
     // The final size will be larger due to central directory and other metadata
     size_t estimated_final_size = current_size + (1024 * 1024); // Add 1MB for metadata
-    
+
     return (int)estimated_final_size;
 }
 
@@ -281,53 +338,56 @@ int finalize_zip_in_memory_bytes(int handle_id, void* output_buffer, size_t buff
     if (handle_id < 0 || handle_id >= MAX_HANDLES || !zip_handles[handle_id] || !zip_handles[handle_id]->is_writer) {
         return -1;
     }
-    
+
     zip_handle_t* handle = zip_handles[handle_id];
-    
+
     // Use mz_zip_writer_finalize_heap_archive which handles the memory allocation properly
     void* data = NULL;
     size_t size = 0;
-    
+
     mz_bool status = mz_zip_writer_finalize_heap_archive(&handle->archive, &data, &size);
     if (!status || !data || size == 0) {
         return -1;
     }
-    
+
     // Check if buffer is large enough
     if (buffer_size < size) {
         return -2; // Buffer too small
     }
-    
+
     // Copy the data directly to the output buffer
     memcpy(output_buffer, data, size);
-    
+
     // The mz_zip_writer_finalize_heap_archive already handles cleanup
     // We just need to free our handle
-    free(handle);
-    zip_handles[handle_id] = NULL;
-    
+    free_zip(handle_id);
+
     return (int)size;
 }
 
 // Open a zip archive from memory
 int open_zip_from_memory(const void* data, size_t size) {
-    if (next_handle_id >= MAX_HANDLES) return -1;
-    
+    int slot = claim_slot();
+    if (slot < 0)
+        return -1;
+
     zip_handle_t* handle = (zip_handle_t*)malloc(sizeof(zip_handle_t));
-    if (!handle) return -1;
-    
-    memset(handle, 0, sizeof(zip_handle_t));
-    handle->is_writer = 0;
-    
-    // Use the correct miniz function for memory-based reading
-    mz_bool status = mz_zip_reader_init_mem(&handle->archive, data, size, 0);
-    
-    if (!status) {
-        free(handle);
+    if (!handle)
+    {
+        free_zip(slot);
         return -1;
     }
-    
-    zip_handles[next_handle_id] = handle;
-    return next_handle_id++;
-}
 
+    memset(handle, 0, sizeof(zip_handle_t));
+    handle->is_writer = 0;
+
+    // Use the correct miniz function for memory-based reading
+    mz_bool status = mz_zip_reader_init_mem(&handle->archive, data, size, 0);
+
+    if (!status) {
+        free_zip(slot);
+        return -1;
+    }
+
+    return use_slot(slot, handle);
+}

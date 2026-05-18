@@ -283,6 +283,19 @@ describe("Memory-based ZipArchiveWriter", () => {
     expect(result).toBeInstanceOf(Uint8Array);
     expect(result.length).toBeGreaterThan(0);
   });
+
+  test("should reuse slots", async () => {
+    const { createMemoryArchive } = await import("./index.ts");
+    // MAX_HANDLES in zip_wrapper.c is 100; loop more than that.
+    for (let i = 0; i < 150; i++) {
+      const writer = createMemoryArchive();
+      expect(writer).toBeInstanceOf(ZipArchiveWriter);
+      writer.addFile("file.txt", new TextEncoder().encode("testing!"), CompressionLevel.DEFAULT);
+      const buf = writer.finalizeToMemory();
+      expect(buf).toBeInstanceOf(Uint8Array);
+      expect(buf.length).toBeGreaterThan(0);
+    }
+  });
 });
 
 describe("ZipArchiveReader", () => {
